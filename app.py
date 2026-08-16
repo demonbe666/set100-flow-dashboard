@@ -177,6 +177,8 @@ _quote_cache = {}
 # long-lived Render process cannot keep showing the previous trading session.
 FLOW_CACHE_MAX_AGE_SECONDS = 60
 FLOW_DOWNLOAD_TIMEOUT_SECONDS = 8
+FLOW_BATCH_SIZE = int(os.environ.get("FLOW_BATCH_SIZE", "10"))
+FLOW_DOWNLOAD_THREADS = os.environ.get("FLOW_DOWNLOAD_THREADS", "0") == "1"
 FLOW_PROBE_SYMBOLS = ("PTT", "GULF", "DELTA")
 PERFORMANCE_CACHE_MAX_AGE_SECONDS = 15 * 60
 _flow_refresh_lock = threading.Lock()
@@ -457,23 +459,25 @@ def _extract_batch_frame(batch, yahoo_symbol):
 
 
 def download_intraday_batch(symbols, period="1d"):
-    """Download requested SET symbols concurrently through yfinance."""
-    yahoo_symbols = [f"{symbol}.BK" for symbol in symbols]
-    batch = yf.download(
-        yahoo_symbols,
-        period=period,
-        interval="1m",
-        group_by="ticker",
-        progress=False,
-        auto_adjust=False,
-        threads=min(8, len(yahoo_symbols)),
-        timeout=FLOW_DOWNLOAD_TIMEOUT_SECONDS,
-    )
     frames = {}
-    for symbol, yahoo_symbol in zip(symbols, yahoo_symbols):
-        frame = _extract_batch_frame(batch, yahoo_symbol)
-        if not frame.empty:
-            frames[symbol] = frame
+    batch_size = max(1, int(FLOW_BATCH_SIZE or 10))
+    for start in range(0, len(symbols), batch_size):
+        chunk = symbols[start:start + batch_size]
+        yahoo_symbols = [f"{symbol}.BK" for symbol in chunk]
+        batch = yf.download(
+            yahoo_symbols,
+            period=period,
+            interval="1m",
+            group_by="ticker",
+            progress=False,
+            auto_adjust=False,
+            threads=FLOW_DOWNLOAD_THREADS,
+            timeout=FLOW_DOWNLOAD_TIMEOUT_SECONDS,
+        )
+        for symbol, yahoo_symbol in zip(chunk, yahoo_symbols):
+            frame = _extract_batch_frame(batch, yahoo_symbol)
+            if not frame.empty:
+                frames[symbol] = frame
     return frames
 
 
