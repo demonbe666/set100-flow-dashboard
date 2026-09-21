@@ -17,6 +17,17 @@
     maxDailyEntries: Number(item.maxDailyEntries),
     commissionRate: Number(item.commissionRate),
     avgLowDays: Number(item.avgLowDays || 30),
+    strategy: item.strategy || 'avg_low_touch',
+    strategyLabel: item.strategyLabel || '',
+    entryMinute: item.entryMinute == null ? null : Number(item.entryMinute),
+    entryLabel: item.entryLabel || '',
+    positionSizing: item.positionSizing || 'budget',
+    tickValue: Number(item.tickValue || 0),
+    betaAwareTp: Boolean(item.betaAwareTp),
+    betaThreshold: Number(item.betaThreshold ?? 1),
+    lowBetaTargetTicks: Number(item.lowBetaTargetTicks || 1),
+    highBetaTargetTicks: Number(item.highBetaTargetTicks || 2),
+    stopTicks: Number(item.stopTicks || 2),
     bidField: item.bidField || 'bid_price',
     slField: item.slField || 'sl_price',
   }));
@@ -61,6 +72,7 @@
     state.equityHistory = state.equityHistory || [];
     state.dailyEntries = state.dailyEntries || {};
     state.lastProcessedBars = state.lastProcessedBars || {};
+    state.fixedEntryRuns = state.fixedEntryRuns || {};
     return state;
   }
 
@@ -120,11 +132,50 @@
   function tradeLevels(row, config = selectedConfig) {
     const hasBidField = row && Object.prototype.hasOwnProperty.call(row, config.bidField);
     const hasSlField = row && Object.prototype.hasOwnProperty.call(row, config.slField);
+    const bid = Number(hasBidField ? row[config.bidField] : (row?.bid_price ?? 0));
+    const betaValue = row?.paper_beta_60d;
+    const beta = betaValue == null ? Number.NaN : Number(betaValue);
+    const targetTicks = config.betaAwareTp && Number.isFinite(beta) && beta < config.betaThreshold
+      ? config.lowBetaTargetTicks
+      : config.highBetaTargetTicks;
     return {
-      bid: Number(hasBidField ? row[config.bidField] : (row?.bid_price ?? 0)),
-      tp: Number(row?.tp_price ?? 0),
-      sl: Number(hasSlField ? row[config.slField] : (row?.sl_price ?? 0)),
+      bid,
+      tp: config.strategy === 'fixed_time_bid_entry'
+        ? priceAfterTicks(bid, targetTicks)
+        : Number(row?.tp_price ?? 0),
+      sl: config.strategy === 'fixed_time_bid_entry'
+        ? priceBeforeTicks(bid, config.stopTicks)
+        : Number(hasSlField ? row[config.slField] : (row?.sl_price ?? 0)),
+      beta,
+      targetTicks,
     };
+  }
+
+  function setTickSize(value) {
+    if (value < 2) return 0.01;
+    if (value < 5) return 0.02;
+    if (value < 10) return 0.05;
+    if (value < 25) return 0.10;
+    if (value < 100) return 0.25;
+    if (value < 200) return 0.50;
+    if (value < 400) return 1.00;
+    return 2.00;
+  }
+
+  function priceAfterTicks(value, ticks) {
+    let priceValue = Number(value || 0);
+    for (let index = 0; index < Math.max(0, ticks); index += 1) {
+      priceValue = Math.round((priceValue + setTickSize(priceValue)) * 100) / 100;
+    }
+    return priceValue;
+  }
+
+  function priceBeforeTicks(value, ticks) {
+    let priceValue = Number(value || 0);
+    for (let index = 0; index < Math.max(0, ticks); index += 1) {
+      priceValue = Math.max(0.01, Math.round((priceValue - setTickSize(Math.max(priceValue - 1e-9, 0.01))) * 100) / 100);
+    }
+    return priceValue;
   }
 
   function useCloudPayload(payload, config) {
@@ -258,6 +309,14 @@
       (minutes >= 10 * 60 + 15 && minutes <= 11 * 60 + 45) ||
       (minutes >= 14 * 60 && minutes <= 15 * 60 + 45)
     );
+  }
+
+  function isConfigEntryWindow(minutes, config = selectedConfig) {
+    if (config.strategy === 'fixed_time_bid_entry') {
+      return Number.isFinite(config.entryMinute) &&
+        minutes >= config.entryMinute && minutes <= config.entryMinute + 2;
+    }
+    return isEntryWindow(minutes);
   }
 
   function sessionEnd(session) {
@@ -462,10 +521,14 @@
 
     const canTrade = (
       data.session_is_today && latest && latest.date >= config.startDate &&
-      isEntryWindow(latest.minutes)
+      isConfigEntryWindow(latest.minutes, config)
     );
     if (canTrade) {
       const entriesToday = state.dailyEntries[latest.date] || [];
+      const alreadyRanFixedEntry = Boolean(
+        config.strategy === 'fixed_time_bid_entry' &&
+        state.fixedEntryRuns?.[config.id]?.[latest.date]
+      );
       const queue = rows
         .filter((row) => {
           const levels = tradeLevels(row, config);
@@ -477,52 +540,68 @@
         })
         .sort((a, b) => Number(a.flow_rank) - Number(b.flow_rank));
 
-      for (const row of queue) {
-        if (entriesToday.length >= config.maxDailyEntries) break;
-        if (state.positions[row.ticker] || entriesToday.includes(row.ticker)) continue;
-        if (!row.market_ts || row.market_ts <= (state.lastProcessedBars[row.ticker] || '')) continue;
-        const levels = tradeLevels(row, config);
-        const bid = levels.bid;
-        const barLow = Number(row.latest_bar_low);
-        const barHigh = Number(row.latest_bar_high);
-        if (!(barLow <= bid && barHigh >= bid)) continue;
-        const open = Number(row.latest_bar_open || bid);
-        const fillPrice = open <= bid ? Math.min(open, bid) : bid;
-        const grossBudget = Math.min(config.positionBudget, state.cash) / (1 + config.commissionRate);
-        const qty = Math.floor(grossBudget / fillPrice / 100) * 100;
-        if (qty <= 0) continue;
-        const entryValue = qty * fillPrice;
-        const buyCommission = entryValue * config.commissionRate;
-        if (entryValue + buyCommission > state.cash) continue;
-        state.cash -= entryValue + buyCommission;
-        state.positions[row.ticker] = {
-          ticker: row.ticker,
-          date: latest.date,
-          session: sessionAt(latest.minutes),
-          qty,
-          entryPrice: fillPrice,
-          entryValue,
-          buyCommission,
-          tp: levels.tp,
-          sl: levels.sl,
-          flowRank: Number(row.flow_rank),
-          entryMarketTs: row.market_ts,
-          lastCheckedBar: row.market_ts,
-          lastPrice: Number(row.last_price || fillPrice),
-        };
-        entriesToday.push(row.ticker);
-        state.dailyEntries[latest.date] = entriesToday;
-        addOrder(state, {
-          marketTs: row.market_ts,
-          side: 'BUY',
-          ticker: row.ticker,
-          qty,
-          price: fillPrice,
-          grossValue: entryValue,
-          commission: buyCommission,
-          realizedPnl: null,
-          reason: `AVG${config.avgLowDays}_TOP${config.topN}_BID_FILL_R${row.flow_rank}`,
-        });
+      if (!alreadyRanFixedEntry) {
+        for (const row of queue) {
+          if (entriesToday.length >= config.maxDailyEntries) break;
+          if (state.positions[row.ticker] || entriesToday.includes(row.ticker)) continue;
+          if (!row.market_ts || row.market_ts <= (state.lastProcessedBars[row.ticker] || '')) continue;
+          const levels = tradeLevels(row, config);
+          const bid = levels.bid;
+          let fillPrice = bid;
+          if (config.strategy !== 'fixed_time_bid_entry') {
+            const barLow = Number(row.latest_bar_low);
+            const barHigh = Number(row.latest_bar_high);
+            if (!(barLow <= bid && barHigh >= bid)) continue;
+            const open = Number(row.latest_bar_open || bid);
+            fillPrice = open <= bid ? Math.min(open, bid) : bid;
+          }
+          const grossBudget = Math.min(config.positionBudget, state.cash) / (1 + config.commissionRate);
+          const qty = config.positionSizing === 'tick_value'
+            ? Math.floor((config.tickValue / setTickSize(fillPrice)) / 100) * 100
+            : Math.floor(grossBudget / fillPrice / 100) * 100;
+          if (qty <= 0) continue;
+          const entryValue = qty * fillPrice;
+          const buyCommission = entryValue * config.commissionRate;
+          if (entryValue + buyCommission > state.cash) continue;
+          state.cash -= entryValue + buyCommission;
+          state.positions[row.ticker] = {
+            ticker: row.ticker,
+            date: latest.date,
+            session: sessionAt(latest.minutes) || 'morning',
+            qty,
+            entryPrice: fillPrice,
+            entryValue,
+            buyCommission,
+            tp: levels.tp,
+            sl: levels.sl,
+            flowRank: Number(row.flow_rank),
+            beta: Number.isFinite(levels.beta) ? levels.beta : null,
+            targetTicks: levels.targetTicks,
+            entryMarketTs: row.market_ts,
+            lastCheckedBar: row.market_ts,
+            lastPrice: Number(row.last_price || fillPrice),
+          };
+          entriesToday.push(row.ticker);
+          state.dailyEntries[latest.date] = entriesToday;
+          addOrder(state, {
+            marketTs: row.market_ts,
+            side: 'BUY',
+            ticker: row.ticker,
+            qty,
+            price: fillPrice,
+            grossValue: entryValue,
+            commission: buyCommission,
+            realizedPnl: null,
+            reason: config.strategy === 'fixed_time_bid_entry'
+              ? `${config.entryLabel}_TOP${config.topN}_BID_TP${levels.targetTicks}_R${row.flow_rank}`
+              : `AVG${config.avgLowDays}_TOP${config.topN}_BID_FILL_R${row.flow_rank}`,
+          });
+        }
+      }
+      if (config.strategy === 'fixed_time_bid_entry') {
+        state.fixedEntryRuns = state.fixedEntryRuns || {};
+        state.fixedEntryRuns[config.id] = state.fixedEntryRuns[config.id] || {};
+        state.fixedEntryRuns[config.id][latest.date] = latestMarketTs;
       }
     }
 
@@ -628,11 +707,14 @@
       .sort((a, b) => Number(a.flow_rank) - Number(b.flow_rank));
     queueBody.innerHTML = queue.length ? queue.map((row) => {
       const levels = tradeLevels(row, config);
+      const betaCell = config.betaAwareTp
+        ? `<td>${Number.isFinite(levels.beta) ? levels.beta.toFixed(2) : '-'}</td>`
+        : '';
       return `<tr>
         <td>${row.flow_rank}</td><td class="ticker">${escapeHtml(row.ticker)}</td>
-        <td>${price(row.last_price)}</td><td class="pos">${price(levels.bid)}</td>
+        ${betaCell}<td>${price(row.last_price)}</td><td class="pos">${price(levels.bid)}</td>
         <td>${price(levels.tp)}</td><td class="neg">${price(levels.sl)}</td></tr>`;
-    }).join('') : '<tr class="paper-empty"><td colspan="6">Waiting for market data</td></tr>';
+    }).join('') : `<tr class="paper-empty"><td colspan="${config.betaAwareTp ? 7 : 6}">Waiting for market data</td></tr>`;
     drawChart(state.equityHistory, config);
 
     if (data) updateStatus(state, positions, data, config);
@@ -651,7 +733,7 @@
     const dot = document.getElementById('paperStatusDot');
     const parts = marketParts(state.lastScanTs);
     const active = data.session_is_today && parts && parts.date >= config.startDate;
-    status.textContent = active ? (isEntryWindow(parts.minutes) ? 'AUTO ACTIVE' : 'MONITORING') : 'WAITING';
+    status.textContent = active ? (isConfigEntryWindow(parts.minutes, config) ? 'AUTO ACTIVE' : 'MONITORING') : 'WAITING';
     const syncLabel = cloudSyncAvailable
       ? (cloudDirty ? 'LOCAL CHANGES' : (cloudSyncPersistent ? 'CLOUD SAVED' : 'SERVER TEMP'))
       : 'THIS DEVICE ONLY';

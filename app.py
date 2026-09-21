@@ -308,7 +308,28 @@ def compute_stock_sd(symbol: str):
         "range_sd_30": float(recent_30["range_sd"].quantile(0.80)),
         "max_range_sd": float(df["range_sd"].max()),
         "n_days": int(len(df)),
-    }
+    }, df["Close"].copy()
+
+
+def compute_paper_betas(close_histories):
+    """Calculate a 60-day beta from the saved SET100 daily-close histories."""
+    if not close_histories:
+        return {}
+    closes = pd.concat(close_histories, axis=1).sort_index()
+    closes.columns = list(close_histories)
+    today_th = datetime.now(ZoneInfo("Asia/Bangkok")).date()
+    closes = closes[pd.Series(closes.index.date, index=closes.index) < today_th]
+    returns = closes.pct_change(fill_method=None)
+    market_return = returns.mean(axis=1, skipna=True)
+    market_variance = market_return.rolling(60, min_periods=40).var()
+    beta_frame = returns.rolling(60, min_periods=40).cov(market_return).div(
+        market_variance, axis=0
+    )
+    betas = {}
+    for symbol in beta_frame.columns:
+        values = beta_frame[symbol].dropna()
+        betas[symbol] = float(values.iloc[-1]) if not values.empty else None
+    return betas
 
 
 def load_all(force=False):
@@ -318,11 +339,21 @@ def load_all(force=False):
 
     results = []
     errors = []
+    close_histories = {}
     for sym in TICKERS:
         try:
-            results.append(compute_stock_sd(sym))
+            result, close_history = compute_stock_sd(sym)
+            results.append(result)
+            close_histories[sym] = close_history
         except Exception as e:
             errors.append({"ticker": sym, "error": str(e)})
+
+    try:
+        beta_by_ticker = compute_paper_betas(close_histories)
+    except Exception:
+        beta_by_ticker = {}
+    for result in results:
+        result["paper_beta_60d"] = beta_by_ticker.get(result["ticker"])
 
     results.sort(key=lambda r: r["avg_range_sd"], reverse=True)
     _cache["data"] = results
@@ -1492,11 +1523,11 @@ PAGE = """
         <canvas id="paperEquityChart"></canvas>
       </div>
       <div class="paper-candidates">
-        <h2>Auto Queue &middot; Top {{ paper_top_n }} Flow &middot; Avg Low {{ paper_avg_low_days }}D</h2>
+        <h2>Auto Queue &middot; Top {{ paper_top_n }} Flow &middot; {{ paper_strategy_label }}</h2>
         <div class="paper-table-wrap">
           <table id="paperQueueTable">
-            <thead><tr><th>Rank</th><th>Ticker</th><th>Last</th><th>Bid</th><th>TP</th><th>SL</th></tr></thead>
-            <tbody><tr class="paper-empty"><td colspan="6">Waiting for market data</td></tr></tbody>
+            <thead><tr><th>Rank</th><th>Ticker</th>{% if paper_beta_aware %}<th>Beta 60D</th>{% endif %}<th>Last</th><th>Bid</th><th>TP</th><th>SL</th></tr></thead>
+            <tbody><tr class="paper-empty"><td colspan="{{ 7 if paper_beta_aware else 6 }}">Waiting for market data</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -1511,8 +1542,12 @@ PAGE = """
     </div>
 
     <h2>Order Log</h2>
-    <div class="paper-engine-note">Auto scan every 60 seconds while this page is open · entry 10:15-11:45 / 14:00-15:45 · exit TP, SL, 12:25, or 16:25</div>
+    <div class="paper-engine-note">Auto scan every 60 seconds while this page is open · {{ paper_strategy_label }} · exit TP, SL, 12:25, or 16:25</div>
+    {% if paper_tick_value %}
+    <div class="paper-engine-note">Tick value {{ "{:,.0f}".format(paper_tick_value) }} baht/stock &middot; capital {{ "{:,.0f}".format(paper_initial_capital) }} &middot; maximum {{ paper_max_daily_entries }} entries/day &middot; commission 70 baht/million/side</div>
+    {% else %}
     <div class="paper-engine-note">Avg Low {{ paper_avg_low_days }} completed days &middot; position budget {{ "{:,.0f}".format(paper_position_budget) }} &middot; maximum {{ paper_max_daily_entries }} entries/day &middot; commission 70 baht/million/side</div>
+    {% endif %}
     <div class="paper-table-wrap">
       <table id="paperOrdersTable">
         <thead><tr><th>Market Time</th><th>Side</th><th>Ticker</th><th>Qty</th><th>Price</th><th>Gross Value</th><th>Commission</th><th>Realized P&amp;L</th><th>Reason</th></tr></thead>
@@ -2577,7 +2612,7 @@ PAGE = """
     });
   });
 </script>
-<script src="{{ url_for('static', filename='paper_trade.js', v='20260814-1') }}"></script>
+<script src="{{ url_for('static', filename='paper_trade.js', v='20260921-1') }}"></script>
 </body>
 </html>
 """
@@ -2663,6 +2698,7 @@ BUY_ZONE_TOP_N = 10
 FOLLOW_DEFAULT_VOL_X = 1.00
 PAPER_START_DATE = "2026-07-20"
 AVG12_PAPER_START_DATE = "2026-08-03"
+FLOW1045_BETA_PAPER_START_DATE = "2026-09-22"
 PAPER_INITIAL_CAPITAL = 5_000_000.0
 PAPER_POSITION_BUDGET = 1_000_000.0
 PAPER_MAX_DAILY_ENTRIES = 5
@@ -2720,6 +2756,30 @@ PAPER_PORTFOLIOS = {
         "max_daily_entries": 10,
         "storage_key": f"set100-paper-trade-v1-avg12-top10-{AVG12_PAPER_START_DATE}",
     },
+    "flow1045-beta-top5": {
+        "id": "flow1045-beta-top5",
+        "label": "flow10:45-beta-top5",
+        "short_label": "flow10:45 beta",
+        "top_n": 5,
+        "avg_low_days": 0,
+        "strategy": "fixed_time_bid_entry",
+        "strategy_label": "10:45 Beta TP1/TP2 · SL2",
+        "entry_minute": 10 * 60 + 45,
+        "entry_label": "10:45",
+        "start_date": FLOW1045_BETA_PAPER_START_DATE,
+        "bid_field": "instant_bid_price",
+        "sl_field": "instant_sl_price",
+        "position_budget": PAPER_INITIAL_CAPITAL,
+        "max_daily_entries": 5,
+        "position_sizing": "tick_value",
+        "tick_value": 2_000.0,
+        "beta_aware_tp": True,
+        "beta_threshold": 1.0,
+        "low_beta_target_ticks": 1,
+        "high_beta_target_ticks": 2,
+        "stop_ticks": 2,
+        "storage_key": f"set100-paper-trade-v1-flow1045-beta-top5-{FLOW1045_BETA_PAPER_START_DATE}",
+    },
 }
 
 
@@ -2771,6 +2831,17 @@ def paper_render_context(portfolio_id=DEFAULT_PAPER_PORTFOLIO_ID):
             "commissionRate": PAPER_COMMISSION_RATE,
             "topN": item["top_n"],
             "avgLowDays": item["avg_low_days"],
+            "strategy": item.get("strategy", "avg_low_touch"),
+            "strategyLabel": item.get("strategy_label", f"Avg Low {item['avg_low_days']}D"),
+            "entryMinute": item.get("entry_minute"),
+            "entryLabel": item.get("entry_label", ""),
+            "positionSizing": item.get("position_sizing", "budget"),
+            "tickValue": item.get("tick_value"),
+            "betaAwareTp": item.get("beta_aware_tp", False),
+            "betaThreshold": item.get("beta_threshold", 1.0),
+            "lowBetaTargetTicks": item.get("low_beta_target_ticks", 1),
+            "highBetaTargetTicks": item.get("high_beta_target_ticks", 2),
+            "stopTicks": item.get("stop_ticks", 2),
             "bidField": item["bid_field"],
             "slField": item["sl_field"],
             "positionBudget": item["position_budget"],
@@ -2787,6 +2858,9 @@ def paper_render_context(portfolio_id=DEFAULT_PAPER_PORTFOLIO_ID):
         "paper_portfolio_label": portfolio["label"],
         "paper_top_n": portfolio["top_n"],
         "paper_avg_low_days": portfolio["avg_low_days"],
+        "paper_strategy_label": portfolio.get("strategy_label", f"Avg Low {portfolio['avg_low_days']}D"),
+        "paper_tick_value": portfolio.get("tick_value"),
+        "paper_beta_aware": portfolio.get("beta_aware_tp", False),
         "paper_portfolio_nav": list(PAPER_PORTFOLIOS.values()),
         "paper_portfolios_json": json.dumps(browser_configs, separators=(",", ":")),
     }
@@ -2964,6 +3038,10 @@ def build_paper_scan_rows(results, sd_rows):
     rows = []
     for result in results:
         sd_row = sd_rows.get(result["ticker"])
+        latest_bar_close = float(result.get("latest_bar_close") or result.get("last_price") or 0.0)
+        instant_bid_price = price_before_ticks(latest_bar_close, 1) if latest_bar_close > 0 else None
+        instant_tp_price = price_after_ticks(instant_bid_price, 2) if instant_bid_price else None
+        instant_sl_price = price_before_ticks(instant_bid_price, 2) if instant_bid_price else None
         fields = enrich_follow_fields(
             result,
             sd_row,
@@ -2997,7 +3075,11 @@ def build_paper_scan_rows(results, sd_rows):
                 if sd_row and sd_row.get("bid_12_avg") and sd_row.get("bid_tick_size_12")
                 else None
             ),
+            "instant_bid_price": instant_bid_price,
+            "instant_tp_price": instant_tp_price,
+            "instant_sl_price": instant_sl_price,
             "tick_size": fields.get("tick_size"),
+            "paper_beta_60d": sd_row.get("paper_beta_60d") if sd_row else None,
             "paper_level_date": sd_row.get("paper_level_date") if sd_row else None,
         })
     return rows
