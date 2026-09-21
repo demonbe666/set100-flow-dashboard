@@ -237,6 +237,23 @@ def count_price_ticks(start_price: float, end_price: float) -> int:
     return ticks
 
 
+def price_after_ticks(price: float, ticks: int) -> float:
+    """Move a SET quote upward by executable price ticks."""
+    current = round(float(price), 2)
+    for _ in range(max(0, int(ticks))):
+        current = round(current + get_tick_size(current), 2)
+    return current
+
+
+def price_before_ticks(price: float, ticks: int) -> float:
+    """Move a SET quote downward by executable price ticks."""
+    current = round(float(price), 2)
+    for _ in range(max(0, int(ticks))):
+        tick = get_tick_size(max(current - 1e-9, 0.01))
+        current = round(max(0.01, current - tick), 2)
+    return current
+
+
 def compute_stock_sd(symbol: str):
     """ดึงข้อมูลและคำนวณค่า SD-range ของหุ้นตัวเดียว"""
     df = yf.download(
